@@ -63,8 +63,8 @@ Plus: **S** switch instance, **H** rotation guide, **Q** quit.
 
 ```powershell
 # 1. Download the script
-git clone https://github.com/<your-account>/<your-repo>.git
-cd <your-repo>
+git clone https://github.com/punitkshah/APIM-Toolkit.git
+cd APIM-Toolkit
 
 # 2. Run it – signs you in if needed, lets you pick an instance, shows the menu
 ./Invoke-ApimCredentialToolkit.ps1
