@@ -79,7 +79,7 @@
     Regenerates secondary keys only for subscriptions whose ID or name starts with 'test-'.
 
 .EXAMPLE
-    ./Invoke-ApimCredentialToolkit.ps1 -ResourceGroup rg-apim -ApimName contoso-apim -Action RegenerateSecondaryKeys -SubscriptionListFile ./failed_secondary.csv
+    ./Invoke-ApimCredentialToolkit.ps1 -ResourceGroup rg-apim -ApimName contoso-apim -Action RegenerateSecondaryKeys -SubscriptionListFile ./contoso-apim_secondary_failed_20261123_101500.csv
     Retries only the subscriptions that failed in a previous run.
 
 .NOTES
@@ -147,6 +147,12 @@ function Write-Log {
     }
 }
 
+function Get-ReportFilePath {
+    # Prefixes report files with the APIM instance name so reports from different instances stay distinguishable.
+    param([Parameter(Mandatory)][string]$FileName)
+    return Join-Path $script:ReportDir ('{0}_{1}' -f $script:Apim.Name, $FileName)
+}
+
 function Show-AndExport {
     param(
         [object[]]$Rows,
@@ -162,7 +168,7 @@ function Show-AndExport {
         return $null
     }
     $Rows | Format-Table -Property $TableColumns -AutoSize -Wrap | Out-Host
-    $file = Join-Path $script:ReportDir $FileName
+    $file = Get-ReportFilePath $FileName
     try {
         $Rows | Export-Csv -Path $file -NoTypeInformation -Encoding UTF8
         Write-Log ('Saved: {0}' -f $file) 'Ok'
@@ -469,7 +475,7 @@ function Get-SubscriptionKeyInventory {
 
 function Invoke-SubscriptionKeyInventory {
     $rows = @(Get-SubscriptionKeyInventory)
-    $null = Show-AndExport -Rows $rows -Title 'Subscription keys' -FileName '1_subscription_keys.csv' `
+    $null = Show-AndExport -Rows $rows -Title 'Subscription keys' -FileName 'subscription_keys.csv' `
         -TableColumns Sid, DisplayName, InstanceScope, GrantsAccessTo, State, BuiltInAllAccess
     if ($rows.Count -gt 0) {
         $byState = $rows | Group-Object State | ForEach-Object { '{0}: {1}' -f $_.Name, $_.Count }
@@ -524,7 +530,7 @@ function Invoke-NamedValueInventory {
         }
     }
     $rows = @($rows)
-    $null = Show-AndExport -Rows $rows -Title 'Named values holding secrets' -FileName '2_named_values_secrets.csv' `
+    $null = Show-AndExport -Rows $rows -Title 'Named values holding secrets' -FileName 'named_values_secrets.csv' `
         -TableColumns DisplayName, InstanceScope, Storage, KeyVaultIdentity, LastKeyVaultSync
     $plain = @($rows | Where-Object { $_.Storage -like 'PLAIN TEXT*' }).Count
     if ($plain -gt 0) {
@@ -638,9 +644,9 @@ function Invoke-BackendInventory {
     }
     $rows = $rows.ToArray()
 
-    $null = Show-AndExport -Rows $rows -Title 'Backend credentials' -FileName '3_backend_credentials.csv' `
+    $null = Show-AndExport -Rows $rows -Title 'Backend credentials' -FileName 'backend_credentials.csv' `
         -TableColumns Backend, InstanceScope, CredentialKind, CredentialName, ValueSource, Detail
-    $null = Show-AndExport -Rows $certRows -Title 'Certificates stored in APIM' -FileName '3_certificates.csv' `
+    $null = Show-AndExport -Rows $certRows -Title 'Certificates stored in APIM' -FileName 'certificates.csv' `
         -TableColumns Name, InstanceScope, Subject, ExpiresUtc, DaysToExpiry, Status, Source
 
     $literal = @($rows | Where-Object { $_.ValueSource -like 'Literal*' }).Count
@@ -734,7 +740,7 @@ function Invoke-OAuthInventory {
     }
 
     $rows = $rows.ToArray()
-    $null = Show-AndExport -Rows $rows -Title 'OAuth 2.0 / OpenID Connect client secrets' -FileName '4_oauth_openid_secrets.csv' `
+    $null = Show-AndExport -Rows $rows -Title 'OAuth 2.0 / OpenID Connect client secrets' -FileName 'oauth_openid_secrets.csv' `
         -TableColumns Type, DisplayName, ClientId, Endpoint, ClientSecretSet
     return $rows.Count
 }
@@ -790,7 +796,7 @@ function Invoke-LoggerInventory {
         }
     }
     $rows = @($rows)
-    $null = Show-AndExport -Rows $rows -Title 'Logger credentials / connection strings' -FileName '5_logger_credentials.csv' `
+    $null = Show-AndExport -Rows $rows -Title 'Logger credentials / connection strings' -FileName 'logger_credentials.csv' `
         -TableColumns Logger, InstanceScope, LoggerType, AuthMethod, CredentialSource, Target
     return @($rows | Where-Object { $_.AuthMethod -in @('Connection string', 'Instrumentation key') }).Count
 }
@@ -820,7 +826,7 @@ function Invoke-AllInventories {
         $summary.Add([pscustomobject]@{ Area = $k; Count = $count; Status = $status })
     }
     $null = Show-AndExport -Rows $summary.ToArray() -Title ('Credential report summary for {0}' -f $script:Apim.Name) `
-        -FileName '0_summary.csv' -TableColumns Area, Count, Status
+        -FileName 'summary.csv' -TableColumns Area, Count, Status
 }
 
 # ----------------------------------------------------------------------------------------------
@@ -883,8 +889,8 @@ function Invoke-KeyRegeneration {
         }
     }
 
-    $resultFile = Join-Path $script:ReportDir ('{0}_regeneration_results_{1}.csv' -f $keyLower, $stamp)
-    $failedFile = Join-Path $script:ReportDir ('{0}_failed_{1}.csv' -f $keyLower, $stamp)
+    $resultFile = Get-ReportFilePath ('{0}_regeneration_results_{1}.csv' -f $keyLower, $stamp)
+    $failedFile = Get-ReportFilePath ('{0}_failed_{1}.csv' -f $keyLower, $stamp)
     Write-Log ('Regenerating {0} keys for {1} subscription(s)...' -f $KeyType.ToUpper(), $targets.Count) 'Step'
 
     $ok = 0; $failed = 0; $i = 0

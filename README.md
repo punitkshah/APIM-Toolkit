@@ -1,211 +1,203 @@
 # Azure API Management Credential Inventory & Rotation Toolkit
 
-A menu-driven PowerShell toolkit that **finds every credential in an Azure API Management (APIM) instance** and **regenerates subscription keys in bulk**, with confirmation, retries and a CSV report for every run.
+A single PowerShell script for Azure API Management (APIM) that helps you:
 
-Use it to answer two questions quickly:
+- **Find where credentials live**: subscription keys, named values, backends, OAuth 2.0 / OpenID Connect providers and loggers. This is read-only.
+- **Rotate subscription keys in bulk**: you see a preview and must type a confirmation before any key changes.
 
-1. *Where are all the secrets in my APIM instance, and where do they live?*
-2. *How do I rotate every subscription key safely, without doing it one at a time in the portal?*
-
-> **Secret values are never printed or written to disk.** The inventories report *where* each credential lives (Key Vault, named value, literal value, managed identity) so you can plan rotation.
+Reports show *where* each credential is stored (Key Vault, APIM, a literal value or managed identity). They never contain secret values.
 
 ---
 
-## Features
+## Quick start: read-only inventory
 
-| # | Option | What it does |
+**1. Open a PowerShell session.** The easiest option is [Azure Cloud Shell](https://shell.azure.com) in PowerShell mode, where you are already signed in. To run locally, use PowerShell 5.1 or 7+ and install the Az module once:
+
+```powershell
+Install-Module Az.Accounts -Scope CurrentUser
+```
+
+**2. Download and run the script.**
+
+```powershell
+git clone https://github.com/punitkshah/APIM-Toolkit.git
+cd APIM-Toolkit
+./Invoke-ApimCredentialToolkit.ps1 -Action InventoryAll -SkipSecretPresenceCheck
+```
+
+The script signs you in if needed. If your Azure subscription has more than one APIM instance, it lists them so you can choose one.
+
+**3. Open the results.** The script prints the report folder path. Start with `<instance>_summary.csv` (for example, `contoso-apim_summary.csv`), which has one row per area with an item count and status. If any status shows `FAILED`, check `run.log` in the same folder for details.
+
+Nothing in Azure changes, and the **Reader** role on the APIM instance is enough.
+
+**Tips**
+
+- To use the interactive menu, run `./Invoke-ApimCredentialToolkit.ps1` without parameters.
+- To skip the instance list, add `-ResourceGroup <rg> -ApimName <name>`.
+- If APIM is in a different Azure subscription, add `-SubscriptionId <azure-subscription-id>`.
+
+---
+
+## Rotate subscription keys without downtime
+
+Each APIM subscription has a **primary** and a **secondary** key. Rotate one key at a time so clients always have a working key.
+
+> [!WARNING]
+> A regenerated key stops working immediately. Clients still using it receive `401 Unauthorized`. This toolkit does not send new keys to clients. Test in a non-production instance first.
+
+You need the **API Management Service Contributor** role.
+
+1. **Move clients to the primary key.** Ask every client to call APIM with its primary key.
+2. **Preview the secondary key rotation.**
+
+   ```powershell
+   ./Invoke-ApimCredentialToolkit.ps1 -Action RegenerateSecondaryKeys
+   ```
+
+   The script lists the subscriptions it would change and saves them to `<instance>_secondary_selected_<timestamp>.csv`. To cancel without changing anything, press **Enter** at the prompt.
+3. **Regenerate the secondary keys.** Run the same command again. When prompted, type the APIM instance name.
+4. **Move clients to the new secondary key.** Share the new key, for example from **APIM > Subscriptions** in the Azure portal, and confirm that clients use it.
+5. **Rotate the primary keys.** Repeat steps 2–3 with `-Action RegeneratePrimaryKeys`.
+
+**Limit which subscriptions are rotated**
+
+| Goal | Add |
+|---|---|
+| Only subscriptions whose ID or display name matches a pattern | `-SubscriptionFilter 'partner-*'` |
+| Skip the built-in all-access subscription | `-ExcludeBuiltInAllAccess` |
+| Only the IDs listed in a file | `-SubscriptionListFile <file>` (a CSV with a `Sid` column, or one ID per line) |
+
+**If some keys fail**, the script saves the failed subscriptions to `<instance>_<primary|secondary>_failed_<timestamp>.csv` and shows the command to retry only those subscriptions:
+
+```powershell
+./Invoke-ApimCredentialToolkit.ps1 -Action RegenerateSecondaryKeys `
+  -SubscriptionListFile ./apim-credential-reports/<folder>/<instance>_secondary_failed_<timestamp>.csv
+```
+
+> [!NOTE]
+> List files match only the APIM subscription ID (`Sid`). If the same ID exists in several workspaces, all of them are selected. Before you confirm, check the `InstanceScope` column in the preview.
+
+**If a run is interrupted**, a key may have changed even if no result was saved for it. Before you retry, treat every subscription in the `_selected_` CSV as possibly rotated.
+
+**In a pipeline**, add `-Force` to skip the confirmation prompt. Use it only with a filter or list you have already previewed. See [Exit codes](#exit-codes).
+
+---
+
+## Rotate other credentials
+
+The inventory shows where each credential is stored. Rotate each one at its source:
+
+- **Key Vault named values**: Rotate the secret in Key Vault. APIM uses the new version when it refreshes the reference.
+- **Secrets stored in APIM or as literal values**: Rotate at the source, update APIM, and consider moving them to Key Vault named values.
+- **OAuth 2.0 / OpenID Connect client secrets**: Create a new secret at the identity provider (for example, a Microsoft Entra app registration), update APIM, test, then delete the old secret.
+- **Event Hubs loggers**: Rotate the shared access key you are not using, update the referenced named value, then rotate the other key. Use managed identity where possible.
+
+---
+
+## Reference
+
+### What each inventory checks
+
+| Menu | `-Action` | Lists |
 |---|---|---|
-| 1 | **Subscription keys** | Lists every subscription (service level and workspaces) with scope, state, owner, created/expiry dates, and flags the built-in all-access subscription |
-| 2 | **Named values holding secrets** | Lists secret named values, shows whether each is stored in APIM or referenced from Azure Key Vault (identity and last sync status), and flags plain-text values that *look* like secrets |
-| 3 | **Backend credentials** | Lists backend headers, query parameters, authorization headers, client certificates and proxy passwords, and whether each value comes from a named value or is a literal. Also lists APIM certificates with days to expiry |
-| 4 | **OAuth 2.0 / OpenID Connect client secrets** | Lists authorization servers, OpenID Connect providers and credential manager providers, and whether a client secret is configured (checked without reading it out) |
-| 5 | **Logger connection strings** | Lists Event Hubs and Application Insights loggers and whether they use a connection string, instrumentation key or managed identity |
-| 6 | **Full credential report** | Runs options 1–5 and writes a summary |
-| 7 | **Regenerate PRIMARY subscription keys** | Collects all subscription IDs, saves the list, asks for confirmation, then regenerates the primary key for each |
-| 8 | **Regenerate SECONDARY subscription keys** | Same as 7, for the secondary key |
+| 1 | `InventorySubscriptionKeys` | Every subscription at service and workspace level, with scope, state, owner and dates. The built-in all-access subscription is flagged. |
+| 2 | `InventoryNamedValues` | Secret named values, whether each is stored in APIM or Key Vault, and plain-text values that look like secrets |
+| 3 | `InventoryBackends` | Backend headers, query parameters, authorization, client certificates and proxy passwords, plus APIM certificates with days until expiry |
+| 4 | `InventoryOAuth` | OAuth 2.0 authorization servers, OpenID Connect providers and credential manager providers, including whether a client secret is set |
+| 5 | `InventoryLoggers` | Event Hubs and Application Insights loggers, and whether each uses a connection string, an instrumentation key or managed identity |
+| 6 | `InventoryAll` | Runs 1–5 and writes a summary |
+| 7 | `RegeneratePrimaryKeys` | **Changes keys.** Regenerates primary keys after a preview and confirmation. |
+| 8 | `RegenerateSecondaryKeys` | **Changes keys.** Regenerates secondary keys after a preview and confirmation. |
 
-Plus: **S** switch instance, **H** rotation guide, **Q** quit.
-
-### Built for safe, unattended use
-
-- **Typed confirmation** before any key changes (type the instance name), with a clear warning about which clients will break. `-Force` skips it for pipelines.
-- **Automatic retry** with back-off for throttling (HTTP 429) and transient errors (5xx), honouring `Retry-After`.
-- **Full paging** of every list call, and **workspace-aware**: service-level and workspace-level items are both covered.
-- **Graceful degradation**: if a feature is not available on your tier (for example workspaces or credential manager), that section is skipped and the rest continues.
-- **Crash-safe results**: each regeneration result is appended to CSV immediately, so an interruption never loses the record.
-- **Targeted retries**: failures are written to their own CSV, which you can feed straight back in with `-SubscriptionListFile`.
-- **Filtering**: limit regeneration with a wildcard (`-SubscriptionFilter 'partner-*'`) or exclude the built-in all-access subscription.
-- **Friendly errors** for expired sign-in (401) and missing permissions (403).
-- Shows the instance tier and whether it is **Classic** or **v2**.
-
----
-
-## Prerequisites
-
-- **PowerShell 5.1** or **PowerShell 7+** (Windows, macOS, Linux), or **Azure Cloud Shell** (works out of the box)
-- **Az.Accounts** module (provides `Invoke-AzRestMethod`)
-
-  ```powershell
-  Install-Module Az.Accounts -Scope CurrentUser
-  ```
+The menu also has **S** (switch instance), **H** (rotation guide) and **Q** (quit).
 
 ### Permissions
 
 | Task | Minimum role on the APIM instance |
 |---|---|
-| Inventories 1–3, 5 | **Reader** |
-| Inventory 4 – "client secret set?" check | **API Management Service Contributor** (needs `listSecrets`). Use `-SkipSecretPresenceCheck` with Reader only |
-| Options 7 and 8 – regenerate keys | **API Management Service Contributor**, or a custom role with `Microsoft.ApiManagement/service/subscriptions/regeneratePrimaryKey/action` and `.../regenerateSecondaryKey/action` |
+| Inventories with `-SkipSecretPresenceCheck` | **Reader** |
+| Inventory 4 without `-SkipSecretPresenceCheck` | **API Management Service Contributor**. The script calls `listSecrets`, checks the result in memory and reports only whether a secret is set. |
+| Regenerate keys (7, 8) | **API Management Service Contributor**, or a custom role with `Microsoft.ApiManagement/service/subscriptions/regeneratePrimaryKey/action` and `.../regenerateSecondaryKey/action` |
 
----
-
-## Quick start
-
-```powershell
-# 1. Download the script
-git clone https://github.com/punitkshah/APIM-Toolkit.git
-cd APIM-Toolkit
-
-# 2. Run it – signs you in if needed, lets you pick an instance, shows the menu
-./Invoke-ApimCredentialToolkit.ps1
-```
-
-In **Azure Cloud Shell**, upload `Invoke-ApimCredentialToolkit.ps1` and run the same command; you are already signed in.
-
-```
-  ================================================================
-   Azure API Management - Credential Inventory and Rotation Toolkit
-  ================================================================
-   Instance : contoso-apim   (resource group: rg-apim)
-   Tier     : Premium (Classic)   Region: uaenorth
-   Reports  : ./apim-credential-reports/contoso-apim_20261123_010000
-
-   INVENTORY (read-only)
-     1  Subscription keys
-     2  Named values holding secrets
-     3  Backend credentials (headers, query parameters, client certificates)
-     4  OAuth 2.0 / OpenID Connect client secrets
-     5  Logger connection strings (Event Hubs, Application Insights)
-     6  Full credential report (runs 1-5)
-
-   ROTATION (changes keys)
-     7  Regenerate PRIMARY subscription keys
-     8  Regenerate SECONDARY subscription keys
-
-     S  Switch APIM instance      H  Rotation guide      Q  Quit
-```
-
----
-
-## Non-interactive examples
-
-```powershell
-# Full credential report for one instance
-./Invoke-ApimCredentialToolkit.ps1 -ResourceGroup rg-apim -ApimName contoso-apim -Action InventoryAll
-
-# Instance in a different Azure subscription
-./Invoke-ApimCredentialToolkit.ps1 -SubscriptionId <azure-subscription-id> -ResourceGroup rg-apim -ApimName contoso-apim -Action InventoryNamedValues
-
-# Regenerate SECONDARY keys for a subset, skipping the built-in all-access subscription
-./Invoke-ApimCredentialToolkit.ps1 -ResourceGroup rg-apim -ApimName contoso-apim `
-  -Action RegenerateSecondaryKeys -SubscriptionFilter 'partner-*' -ExcludeBuiltInAllAccess
-
-# Retry only the subscriptions that failed in a previous run
-./Invoke-ApimCredentialToolkit.ps1 -ResourceGroup rg-apim -ApimName contoso-apim `
-  -Action RegenerateSecondaryKeys -SubscriptionListFile ./apim-credential-reports/<folder>/secondary_failed_<timestamp>.csv
-
-# Pipeline / automation (no prompt)
-./Invoke-ApimCredentialToolkit.ps1 -ResourceGroup rg-apim -ApimName contoso-apim `
-  -Action RegeneratePrimaryKeys -Force
-```
-
----
-
-## Parameters
+### Parameters
 
 | Parameter | Description | Default |
 |---|---|---|
-| `-SubscriptionId` | Azure subscription that holds the APIM instance | Current Az context |
-| `-ResourceGroup` | Resource group of the APIM instance | Pick from list |
-| `-ApimName` | APIM instance name | Pick from list |
-| `-Action` | Run one action and exit: `InventorySubscriptionKeys`, `InventoryNamedValues`, `InventoryBackends`, `InventoryOAuth`, `InventoryLoggers`, `InventoryAll`, `RegeneratePrimaryKeys`, `RegenerateSecondaryKeys` | Interactive menu |
-| `-SubscriptionFilter` | Wildcard on subscription ID or display name, for regeneration | `*` |
-| `-SubscriptionListFile` | CSV with a `Sid` column, or a text file with one ID per line, to target specific subscriptions | – |
+| `-Action` | Run one action and exit. See the table above. | Interactive menu |
+| `-SubscriptionId` | Azure subscription that contains the APIM instance. This is not an APIM subscription. | Current Az context |
+| `-ResourceGroup` | Resource group of the APIM instance | Choose from a list |
+| `-ApimName` | APIM instance name | Choose from a list |
+| `-SubscriptionFilter` | Wildcard pattern for the APIM subscription ID or display name to rotate | `*` |
+| `-SubscriptionListFile` | CSV file with a `Sid` column, or a text file with one APIM subscription ID per line | – |
 | `-ExcludeBuiltInAllAccess` | Skip the built-in all-access (`master`) subscription | Off |
-| `-Force` | Skip the typed confirmation before regeneration | Off |
-| `-SkipSecretPresenceCheck` | Do not call `listSecrets` on OAuth / OpenID Connect providers | Off |
+| `-Force` | Skip the confirmation prompt before regeneration | Off |
+| `-SkipSecretPresenceCheck` | Do not call `listSecrets` on OAuth 2.0 / OpenID Connect providers | Off |
 | `-OutputPath` | Root folder for reports | `./apim-credential-reports` |
-| `-DelayMs` | Pause between regeneration calls (throttling protection) | `250` |
+| `-DelayMs` | Pause between regeneration calls, to avoid throttling | `250` |
 | `-ApiVersion` | Microsoft.ApiManagement ARM API version | `2024-05-01` |
 
-### Exit codes (non-interactive mode)
+### Exit codes
 
 | Code | Meaning |
 |---|---|
-| `0` | Success |
-| `1` | Error (sign-in, instance not found, permissions, unexpected failure) |
+| `0` | No fatal error. A rotation also returns `0` if you cancel or no subscriptions match. `InventoryAll` can return `0` even when a section fails. |
+| `1` | Error: sign-in failed, the instance wasn't found, permission was denied, or an unexpected failure occurred |
 | `2` | Regeneration finished, but one or more subscriptions failed |
 
----
+In automation, `0` alone does not prove the work was done. For inventories, check `<instance>_summary.csv`. For rotations, compare the `_selected_` and `_regeneration_results_` CSVs.
 
-## Output
+### Output files
 
-Each run creates a time-stamped folder: `apim-credential-reports/<instance>_<yyyyMMdd_HHmmss>/`
+Each run creates a folder: `apim-credential-reports/<instance>_<yyyyMMdd_HHmmss>/`. Every CSV name starts with the APIM instance name, so you can collect reports from several instances in one place and still tell them apart. A section with no items does not create a CSV.
 
 | File | Contents |
 |---|---|
-| `0_summary.csv` | Counts per area (full report) |
-| `1_subscription_keys.csv` | Subscription inventory |
-| `2_named_values_secrets.csv` | Secret named values and where they are stored |
-| `3_backend_credentials.csv` | Backend credentials and their value source |
-| `3_certificates.csv` | Certificates with expiry and days remaining |
-| `4_oauth_openid_secrets.csv` | OAuth 2.0 / OpenID Connect / credential manager providers |
-| `5_logger_credentials.csv` | Logger authentication method and credential source |
-| `<primary\|secondary>_selected_<ts>.csv` | Subscriptions selected for regeneration (before any change) |
-| `<primary\|secondary>_regeneration_results_<ts>.csv` | Result per subscription, written as it runs |
-| `<primary\|secondary>_failed_<ts>.csv` | Failures only – use with `-SubscriptionListFile` to retry |
+| `<instance>_summary.csv` | Item count and status per area (`InventoryAll` only) |
+| `<instance>_subscription_keys.csv` | Subscription inventory |
+| `<instance>_named_values_secrets.csv` | Secret named values and where they are stored |
+| `<instance>_backend_credentials.csv` | Backend credentials and their value source |
+| `<instance>_certificates.csv` | Certificates with expiry date and days remaining |
+| `<instance>_oauth_openid_secrets.csv` | OAuth 2.0, OpenID Connect and credential manager providers |
+| `<instance>_logger_credentials.csv` | Logger authentication method and credential source |
+| `<instance>_<primary\|secondary>_selected_<ts>.csv` | Subscriptions selected for rotation, saved before any change |
+| `<instance>_<primary\|secondary>_regeneration_results_<ts>.csv` | Result for each subscription, added during the run |
+| `<instance>_<primary\|secondary>_failed_<ts>.csv` | Failed subscriptions only. Use with `-SubscriptionListFile` to retry. |
 | `run.log` | Time-stamped log of the run |
 
-> Reports contain **no secret values**, but they do contain resource names, client IDs and endpoints. Treat them as internal and keep them out of source control (see `.gitignore` below).
+For example, after a full inventory and a secondary key rotation of `contoso-apim`:
 
----
-
-## Recommended rotation sequence
-
-### Subscription keys (zero downtime)
-
-1. Run **option 1** to record the current subscriptions.
-2. Ask every client to use the **primary** key.
-3. Run **option 8** to regenerate **secondary** keys.
-4. Give clients the new **secondary** key and confirm they use it.
-5. Run **option 7** to regenerate **primary** keys.
-
-### Other credentials
-
-- **Key Vault named values** – rotate the secret in Key Vault; APIM picks up the new version when it refreshes the reference.
-- **Secrets stored in APIM / literal values** – rotate at the source, update APIM, and move them to Key Vault named values.
-- **OAuth 2.0 / OpenID Connect client secrets** – create a new secret at the identity provider (for example the Microsoft Entra app registration), update APIM, test, then delete the old secret.
-- **Event Hubs loggers** – rotate the shared access key you are not using, update the referenced named value, then rotate the other key. Prefer managed identity where possible.
-
----
-
-## Suggested `.gitignore`
-
-```gitignore
-# Toolkit reports – contain resource metadata
+```text
 apim-credential-reports/
+└── contoso-apim_20261123_101500/
+    ├── contoso-apim_summary.csv
+    ├── contoso-apim_subscription_keys.csv
+    ├── contoso-apim_named_values_secrets.csv
+    ├── contoso-apim_backend_credentials.csv
+    ├── contoso-apim_certificates.csv
+    ├── contoso-apim_oauth_openid_secrets.csv
+    ├── contoso-apim_logger_credentials.csv
+    ├── contoso-apim_secondary_selected_20261123_102030.csv
+    ├── contoso-apim_secondary_regeneration_results_20261123_102030.csv
+    ├── contoso-apim_secondary_failed_20261123_102030.csv
+    └── run.log
 ```
 
----
+Reports contain **no secret values**, but they do include resource names, client IDs and endpoints. Keep them internal and out of source control. This repository already ignores `apim-credential-reports/`. If you copy the script elsewhere, add that folder to your `.gitignore`.
 
-## Notes and limitations
+### Built-in safeguards
 
-- Works with Classic (Developer, Basic, Standard, Premium, Consumption) and v2 tiers. Features not available on a tier are skipped automatically.
-- The script uses the Azure Resource Manager REST API (`Invoke-AzRestMethod`), so it follows your current Azure cloud (public or sovereign).
-- Inventories are read-only. Only options 7 and 8 change anything.
-- Subscription key regeneration takes effect immediately. Any client still using the old key will receive `401 Unauthorized`.
-- Self-hosted gateway tokens, the Management API access keys and Git configuration access are not covered.
-- **Always test in a non-production instance first.**
+- **Confirmation**: before regenerating keys, you must type the instance name. `-Force` skips this step.
+- **Retries**: throttling (429) and transient server errors (5xx) are retried with back-off, and `Retry-After` is honored.
+- **Complete coverage**: every list call is paged, and service-level and workspace-level items are included.
+- **Unsupported features are skipped**: if your tier doesn't support a feature, such as workspaces, that section is skipped and the rest of the run continues.
+- **Clear errors**: an expired sign-in (401) or missing permission (403) produces a readable message.
+
+### Notes and limitations
+
+- Works with Classic tiers (Developer, Basic, Standard, Premium, Consumption) and v2 tiers.
+- Uses the Azure Resource Manager REST API through `Invoke-AzRestMethod`, so it works in whichever Azure cloud you're signed in to (public or sovereign).
+- Does not cover self-hosted gateway tokens, Management API access keys or Git configuration access.
 
 ---
 
